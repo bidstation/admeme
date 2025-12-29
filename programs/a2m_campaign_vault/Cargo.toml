@@ -1,0 +1,22 @@
+[package]
+name = "a2m_campaign_vault"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "a2m_campaign_vault"
+crate-type = ["cdylib", "lib"]
+path = "src/lib.rs"
+
+[dependencies]
+anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
+anchor-spl  = { version = "0.32.1", features = ["token", "associated_token"] }
+solana-sha256-hasher = "3.1.0"
+
+[features]
+default = []
+no-entrypoint = []
+no-idl = []
+cpi = ["no-entrypoint"]
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = ["anchor-lang/anchor-debug", "anchor-spl/anchor-debug"]
