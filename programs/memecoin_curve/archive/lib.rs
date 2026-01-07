@@ -1,13 +1,16 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::program_option::COption;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{
     self, Burn, Mint, MintTo, SetAuthority, Token, TokenAccount, Transfer,
 };
 use anchor_spl::token::spl_token::instruction::AuthorityType;
+use anchor_lang::solana_program::program::invoke_signed;
+use mpl_token_metadata::instructions::CreateMetadataAccountV3Builder;
+use mpl_token_metadata::types::DataV2;
+use mpl_token_metadata::ID as TMETA_ID;
 
 // Replace with your deployed program id before deployment
-declare_id!("BKWVgcPdNvYXUVBzfy17RDtSy7nvyxudUEF2yK34EYvu");
+declare_id!("8nQjB973anAnpkdVQJjYtGi969m3cFanMXyos8Epn1UU");
 
 #[program]
 pub mod memecoin_curve {
@@ -44,36 +47,52 @@ pub mod memecoin_curve {
         Ok(())
     }
 
-    /// Transfer the memecoin mint authority from the creator to the memecoin PDA.
-    /// Intended flow:
-    /// 1) `create_memecoin` initializes the mint with `creator` as temporary mint authority
-    /// 2) client creates Metaplex metadata directly (mint authority = creator)
-    /// 3) client calls `handoff_mint_authority` so `buy_memecoin` can mint (mint authority = memecoin PDA)
-    pub fn handoff_mint_authority(ctx: Context<HandoffMintAuthority>) -> Result<()> {
-        // Only the original creator can do the handoff
+    /// Create Metaplex metadata for the memecoin mint. The memecoin PDA signs as mint authority
+    /// and is set as update authority as well.
+    pub fn set_token_metadata(
+        ctx: Context<SetTokenMetadata>,
+        name: String,
+        symbol: String,
+        uri: String,
+    ) -> Result<()> {
+        // Only the original creator is allowed to set/update metadata
         require_keys_eq!(
             ctx.accounts.creator.key(),
             ctx.accounts.memecoin.creator,
             CurveError::Unauthorized
         );
-        // Prevent off-curve mints before the handoff
-        require!(ctx.accounts.memecoin_mint.supply == 0, CurveError::InvalidState);
-        // Ensure the creator is still the current mint authority
-        require!(
-            ctx.accounts.memecoin_mint.mint_authority == COption::Some(ctx.accounts.creator.key()),
-            CurveError::InvalidState
-        );
-
-        let cpi_accounts = SetAuthority {
-            account_or_mint: ctx.accounts.memecoin_mint.to_account_info(),
-            current_authority: ctx.accounts.creator.to_account_info(),
+        // Sanity checks
+        require_keys_eq!(ctx.accounts.token_metadata_program.key(), TMETA_ID, CurveError::InvalidParam);
+        // Build DataV2
+        let data = DataV2 {
+            name,
+            symbol,
+            uri,
+            seller_fee_basis_points: 0,
+            creators: None,
+            collection: None,
+            uses: None,
         };
-        token::set_authority(
-            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
-            AuthorityType::MintTokens,
-            Some(ctx.accounts.memecoin.key()),
-        )?;
-
+        let ix = CreateMetadataAccountV3Builder::new()
+            .metadata(ctx.accounts.metadata.key())
+            .mint(ctx.accounts.memecoin_mint.key())
+            .mint_authority(ctx.accounts.memecoin.key())
+            .payer(ctx.accounts.creator.key())
+            .update_authority(ctx.accounts.memecoin.key(), true)
+            .data(data)
+            .is_mutable(true)
+            .instruction();
+        let seeds = [b"memecoin".as_ref(), ctx.accounts.memecoin.seed.as_ref(), &[ctx.accounts.memecoin.bump]];
+        let accounts = vec![
+            ctx.accounts.metadata.to_account_info(),
+            ctx.accounts.memecoin_mint.to_account_info(),
+            ctx.accounts.memecoin.to_account_info(),        // mint authority (signer via seeds)
+            ctx.accounts.creator.to_account_info(),         // payer
+            ctx.accounts.memecoin.to_account_info(),        // update authority (signer via seeds)
+            ctx.accounts.system_program.to_account_info(),
+        ];
+        invoke_signed(&ix, &accounts, &[&seeds])
+            .map_err(|_| error!(CurveError::Unauthorized))?;
         Ok(())
     }
 
@@ -564,8 +583,7 @@ pub struct CreateMemecoin<'info> {
         init,
         payer = creator,
         mint::decimals = decimals,
-        mint::authority = creator,
-        mint::freeze_authority = memecoin,
+        mint::authority = memecoin,
     )]
     pub memecoin_mint: Account<'info, Mint>,
 
@@ -593,25 +611,6 @@ pub struct CreateMemecoin<'info> {
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, anchor_lang::system_program::System>,
-}
-
-#[derive(Accounts)]
-pub struct HandoffMintAuthority<'info> {
-    pub creator: Signer<'info>,
-
-    #[account(
-        seeds = [b"memecoin", memecoin.seed.as_ref()],
-        bump = memecoin.bump,
-    )]
-    pub memecoin: Account<'info, Memecoin>,
-
-    #[account(
-        mut,
-        constraint = memecoin_mint.key() == memecoin.memecoin_mint
-    )]
-    pub memecoin_mint: Account<'info, Mint>,
-
-    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -886,6 +885,30 @@ pub struct UpdateLiquidityDefaults<'info> {
 }
 
 #[derive(Accounts)]
+pub struct SetTokenMetadata<'info> {
+    #[account(mut)]
+    pub creator: Signer<'info>,
+
+    #[account(
+        seeds = [b"memecoin", memecoin.seed.as_ref()],
+        bump = memecoin.bump,
+    )]
+    pub memecoin: Account<'info, Memecoin>,
+
+    #[account(constraint = memecoin_mint.key() == memecoin.memecoin_mint)]
+    pub memecoin_mint: Account<'info, Mint>,
+
+    /// CHECK: Metaplex metadata PDA for this mint
+    #[account(mut)]
+    pub metadata: UncheckedAccount<'info>,
+
+    /// CHECK: Metaplex Token Metadata program id
+    pub token_metadata_program: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, anchor_lang::system_program::System>,
+}
+
+#[derive(Accounts)]
 pub struct SweepExcess<'info> {
     /// Anyone can trigger
     pub caller: Signer<'info>,
@@ -956,8 +979,6 @@ pub enum CurveError {
     InsufficientReserve,
     #[msg("Unauthorized")] 
     Unauthorized,
-    #[msg("Invalid state")]
-    InvalidState,
 }
 
 /* -------------------- Helpers -------------------- */

@@ -3,7 +3,7 @@ use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use solana_sha256_hasher::hashv;
 
-declare_id!("AxuNrRTdrohnjWbkGNEmmAyScUBfEnxhh9cVx1A87UrW");
+declare_id!("2s7V6oGMGMY2ys9y9FHBKt9HPvxqCUK2DpXEWegWzA8G");
 
 #[program]
 pub mod a2m_campaign_vault {
