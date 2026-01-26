@@ -6,7 +6,7 @@ use anchor_spl::token::{
 };
 use anchor_spl::token::spl_token::instruction::AuthorityType;
 
-// Replace with your deployed program id before deployment
+// Deployed program id (mainnet-beta)
 declare_id!("BKWVgcPdNvYXUVBzfy17RDtSy7nvyxudUEF2yK34EYvu");
 
 #[program]
@@ -407,34 +407,38 @@ pub mod memecoin_curve {
         let seeds = [b"memecoin".as_ref(), ctx.accounts.memecoin.seed.as_ref(), &[ctx.accounts.memecoin.bump]];
 
         // Revoke MintTokens authority
-        let cpi_accounts = SetAuthority {
-            account_or_mint: ctx.accounts.memecoin_mint.to_account_info(),
-            current_authority: ctx.accounts.memecoin.to_account_info(),
-        };
-        token::set_authority(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts,
-                &[&seeds],
-            ),
-            AuthorityType::MintTokens,
-            None,
-        )?;
+        if ctx.accounts.memecoin_mint.mint_authority == COption::Some(ctx.accounts.memecoin.key()) {
+            let cpi_accounts = SetAuthority {
+                account_or_mint: ctx.accounts.memecoin_mint.to_account_info(),
+                current_authority: ctx.accounts.memecoin.to_account_info(),
+            };
+            token::set_authority(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    cpi_accounts,
+                    &[&seeds],
+                ),
+                AuthorityType::MintTokens,
+                None,
+            )?;
+        }
 
-        // Revoke FreezeAccount authority
-        let cpi_accounts2 = SetAuthority {
-            account_or_mint: ctx.accounts.memecoin_mint.to_account_info(),
-            current_authority: ctx.accounts.memecoin.to_account_info(),
-        };
-        token::set_authority(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                cpi_accounts2,
-                &[&seeds],
-            ),
-            AuthorityType::FreezeAccount,
-            None,
-        )?;
+        // Revoke FreezeAccount authority (if present)
+        if ctx.accounts.memecoin_mint.freeze_authority == COption::Some(ctx.accounts.memecoin.key()) {
+            let cpi_accounts2 = SetAuthority {
+                account_or_mint: ctx.accounts.memecoin_mint.to_account_info(),
+                current_authority: ctx.accounts.memecoin.to_account_info(),
+            };
+            token::set_authority(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    cpi_accounts2,
+                    &[&seeds],
+                ),
+                AuthorityType::FreezeAccount,
+                None,
+            )?;
+        }
 
         Ok(())
     }
@@ -565,7 +569,6 @@ pub struct CreateMemecoin<'info> {
         payer = creator,
         mint::decimals = decimals,
         mint::authority = creator,
-        mint::freeze_authority = memecoin,
     )]
     pub memecoin_mint: Account<'info, Mint>,
 

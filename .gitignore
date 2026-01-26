@@ -5,3 +5,4 @@ target
 node_modules
 test-ledger
 .yarn
+programs/memecoin_curve/archive/230126/lib.rs
