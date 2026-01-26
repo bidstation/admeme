@@ -6,8 +6,8 @@ Public repository for the **AdMeme** on-chain programs (Rust + Anchor). This rep
 
 | Program | Crate name | Path in this repo | Purpose |
 | --- | --- | --- | --- |
-| **a2m_campaign_vault** | `a2m_campaign_vault` | `./a2m_campaign_vault/src/lib.rs` | Campaign vault + Merkle-based payouts for advertisers. |
-| **memecoin_curve** | `memecoin_curve` | `./memecoin-curve/src/lib.rs` | Per-meme token with a linear bonding curve (buy/sell) + fee escrow and optional reserve management. |
+| **a2m_campaign_vault** | `a2m_campaign_vault` | `./programs/a2m_campaign_vault/src/lib.rs` | Campaign vault + Merkle-based payouts for advertisers. |
+| **memecoin_curve** | `memecoin_curve` | `./programs/memecoin-curve/src/lib.rs` | Per-meme token with a linear bonding curve (buy/sell) + fee escrow and optional reserve management. |
 
 ## a2m_campaign_vault
 
