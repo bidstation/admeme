@@ -405,7 +405,8 @@ pub struct Claim<'info> {
     #[account(seeds = [b"platform"], bump)]
     pub platform: Account<'info, PlatformConfig>,
 
-    /// Recipient of tokens
+    /// CHECK: Recipient wallet (or PDA). Safety: the ATA is constrained via
+    /// `associated_token::authority = recipient` and `associated_token::mint = mint`.
     pub recipient: UncheckedAccount<'info>,
     #[account(
         init_if_needed,
@@ -467,7 +468,8 @@ pub struct WithdrawFees<'info> {
     #[account(seeds = [b"platform"], bump)]
     pub platform: Account<'info, PlatformConfig>,
 
-    /// Recipient of tokens
+    /// CHECK: Recipient wallet (or PDA). Safety: the ATA is constrained via
+    /// `associated_token::authority = recipient` and `associated_token::mint = mint`.
     pub recipient: UncheckedAccount<'info>,
     #[account(
         init_if_needed,
