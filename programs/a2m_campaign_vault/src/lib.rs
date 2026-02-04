@@ -5,6 +5,19 @@ use solana_sha256_hasher::hashv;
 
 declare_id!("2s7V6oGMGMY2ys9y9FHBKt9HPvxqCUK2DpXEWegWzA8G");
 
+// ---- Campaign pricing / fee config (hardcoded on-chain) ----
+// 3% platform fee, taken upfront from advertiser deposits. Non-refundable.
+const PLATFORM_FEE_BPS: u16 = 300;
+// Allowed campaign mints (mainnet)
+const A2M_MINT: Pubkey = Pubkey::new_from_array([
+    159, 225, 109, 36, 121, 224, 103, 249, 55, 248, 48, 63, 243, 61, 85, 239,
+    165, 118, 169, 247, 32, 26, 100, 112, 88, 16, 215, 48, 197, 158, 140, 20,
+]);
+const USDC_MINT: Pubkey = Pubkey::new_from_array([
+    198, 250, 122, 243, 190, 219, 173, 58, 61, 101, 243, 106, 171, 201, 116, 49,
+    177, 187, 228, 194, 210, 246, 224, 228, 124, 166, 2, 3, 69, 47, 93, 97,
+]);
+
 #[program]
 pub mod a2m_campaign_vault {
     use super::*;
@@ -23,11 +36,15 @@ pub mod a2m_campaign_vault {
         campaign_id: u64,
         advertiser_deposit_amount: u64,
     ) -> Result<()> {
+        // Restrict to supported tokens only (prevents locking funds in unsupported mints).
+        let mint = ctx.accounts.mint.key();
+        require!(mint == A2M_MINT || mint == USDC_MINT, ErrCode::InvalidMint);
+
         // init state
         {
             let c = &mut ctx.accounts.campaign;
             c.advertiser = ctx.accounts.advertiser.key();
-            c.mint = ctx.accounts.mint.key();
+            c.mint = mint;
             c.status = Status::Open;
             c.vault_bump = ctx.bumps.campaign;
             c.advertiser_deposit = 0;
@@ -38,12 +55,55 @@ pub mod a2m_campaign_vault {
 
         // optional initial advertiser funding
         if advertiser_deposit_amount > 0 {
-            token::transfer(
-                ctx.accounts.transfer_from_advertiser_to_vault(),
-                advertiser_deposit_amount,
-            )?;
+            // Fee is calculated from gross deposit (floor division, base units)
+            let fee = ((advertiser_deposit_amount as u128)
+                .checked_mul(PLATFORM_FEE_BPS as u128)
+                .ok_or(ErrCode::MathOverflow)?
+                / 10_000u128) as u64;
+            let net = advertiser_deposit_amount
+                .checked_sub(fee)
+                .ok_or(ErrCode::MathOverflow)?;
+
+            // Transfer fee to platform fee vault (ATA owned by platform PDA)
+            if fee > 0 {
+                token::transfer(
+                    ctx.accounts.transfer_from_advertiser_to_platform_fee_vault(),
+                    fee,
+                )?;
+            }
+            // Transfer net to campaign vault (ATA owned by campaign PDA)
+            if net > 0 {
+                token::transfer(
+                    ctx.accounts.transfer_from_advertiser_to_vault(),
+                    net,
+                )?;
+            }
+            // Record gross deposit for off-chain impressions math
             ctx.accounts.campaign.advertiser_deposit = advertiser_deposit_amount;
         }
+        Ok(())
+    }
+
+    /* -------------------- Platform fee withdrawal -------------------- */
+
+    pub fn withdraw_fees(ctx: Context<WithdrawFees>, amount: u64) -> Result<()> {
+        // Only platform authority may withdraw fees
+        require_keys_eq!(
+            ctx.accounts.platform_signer.key(),
+            ctx.accounts.platform.authority,
+            ErrCode::NotAuthorized
+        );
+        require!(amount > 0, ErrCode::InvalidAmount);
+        require!(ctx.accounts.platform_fee_vault.amount >= amount, ErrCode::InsufficientVault);
+
+        let bump = ctx.bumps.platform;
+        let seeds: &[&[u8]] = &[b"platform", &[bump]];
+        token::transfer(
+            ctx.accounts
+                .transfer_from_fee_vault_to_recipient()
+                .with_signer(&[seeds]),
+            amount,
+        )?;
         Ok(())
     }
 
@@ -230,6 +290,16 @@ pub struct InitCampaign<'info> {
     pub advertiser_ata: Account<'info, TokenAccount>,
     pub mint: Account<'info, Mint>,
 
+    #[account(seeds = [b"platform"], bump)]
+    pub platform: Account<'info, PlatformConfig>,
+    #[account(
+        init_if_needed,
+        payer = advertiser,
+        associated_token::mint = mint,
+        associated_token::authority = platform
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
+
     #[account(
         init,
         payer = advertiser,
@@ -258,6 +328,17 @@ impl<'info> InitCampaign<'info> {
         let c = Transfer {
             from: self.advertiser_ata.to_account_info(),
             to: self.vault.to_account_info(),
+            authority: self.advertiser.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), c)
+    }
+
+    fn transfer_from_advertiser_to_platform_fee_vault(
+        &self,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let c = Transfer {
+            from: self.advertiser_ata.to_account_info(),
+            to: self.platform_fee_vault.to_account_info(),
             authority: self.advertiser.to_account_info(),
         };
         CpiContext::new(self.token_program.to_account_info(), c)
@@ -324,9 +405,7 @@ pub struct Claim<'info> {
     #[account(seeds = [b"platform"], bump)]
     pub platform: Account<'info, PlatformConfig>,
 
-    /// CHECK: This account is only used as the *authority* for deriving/creating the recipient ATA.
-    /// We do not read or write any data from `recipient` itself. The ATA constraints enforce the mint,
-    /// and the associated token program derives the ATA from (recipient, mint).
+    /// Recipient of tokens
     pub recipient: UncheckedAccount<'info>,
     #[account(
         init_if_needed,
@@ -380,6 +459,52 @@ impl<'info> Claim<'info> {
     }
 }
 
+/* ------ Withdraw platform fees ------ */
+
+#[derive(Accounts)]
+pub struct WithdrawFees<'info> {
+    pub platform_signer: Signer<'info>,
+    #[account(seeds = [b"platform"], bump)]
+    pub platform: Account<'info, PlatformConfig>,
+
+    /// Recipient of tokens
+    pub recipient: UncheckedAccount<'info>,
+    #[account(
+        init_if_needed,
+        payer = fee_payer,
+        associated_token::mint = mint,
+        associated_token::authority = recipient
+    )]
+    pub recipient_ata: Account<'info, TokenAccount>,
+
+    pub mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = platform
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
+
+    #[account(mut)]
+    pub fee_payer: Signer<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, anchor_lang::system_program::System>,
+}
+impl<'info> WithdrawFees<'info> {
+    fn transfer_from_fee_vault_to_recipient(
+        &self,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let c = Transfer {
+            from: self.platform_fee_vault.to_account_info(),
+            to: self.recipient_ata.to_account_info(),
+            authority: self.platform.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), c)
+    }
+}
+
 // (Booster claim instruction/accounts removed)
 
 /* ------------ Events ------------ */
@@ -411,6 +536,8 @@ pub enum ErrCode {
     InvalidRegistry,
     #[msg("Invalid amount")]
     InvalidAmount,
+    #[msg("Invalid mint")]
+    InvalidMint,
 }
 
 /* ------------ Helpers ------------ */

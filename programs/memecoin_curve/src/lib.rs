@@ -9,6 +9,9 @@ use anchor_spl::token::spl_token::instruction::AuthorityType;
 // Deployed program id (mainnet-beta)
 declare_id!("BKWVgcPdNvYXUVBzfy17RDtSy7nvyxudUEF2yK34EYvu");
 
+// Trading fee: 1% total, split 50/50 between platform and uploader (creator).
+const TRADE_FEE_BPS_TOTAL: u16 = 100; // 1%
+
 #[program]
 pub mod memecoin_curve {
     use super::*;
@@ -25,7 +28,8 @@ pub mod memecoin_curve {
         fee_bps: u16,
         decimals: u8,
     ) -> Result<()> {
-        require!(fee_bps <= 10_000, CurveError::InvalidParam);
+        // Fee is fixed (prevents per-memecoin fee mismatch across UI/backends).
+        require!(fee_bps == TRADE_FEE_BPS_TOTAL, CurveError::InvalidParam);
         let state = &mut ctx.accounts.memecoin;
         state.bump = ctx.bumps.memecoin;
         state.seed = seed;
@@ -36,7 +40,8 @@ pub mod memecoin_curve {
         state.creator_fee_vault = ctx.accounts.creator_fee_vault.key();
         state.a = a as u128;
         state.b = b as u128;
-        state.fee_bps = fee_bps;
+        // Keep field for compatibility, but treat it as informational (fixed constant on-chain).
+        state.fee_bps = TRADE_FEE_BPS_TOTAL;
         state.decimals = decimals;
         state.supply = 0u128;
         state.created_at = Clock::get()?.unix_timestamp;
@@ -99,7 +104,7 @@ pub mod memecoin_curve {
             ctx.accounts.memecoin.decimals,
         )?;
         let fee = cost
-            .checked_mul(ctx.accounts.memecoin.fee_bps as u128)
+            .checked_mul(TRADE_FEE_BPS_TOTAL as u128)
             .ok_or_else(|| error!(CurveError::MathOverflow))?
             .checked_div(10_000)
             .ok_or_else(|| error!(CurveError::MathOverflow))?;
@@ -115,9 +120,19 @@ pub mod memecoin_curve {
 
         // Move base to reserve and creator escrow (split)
         let cost_u64 = u128_to_u64_checked(cost)?;
-        let fee_u64 = u128_to_u64_checked(fee)?;
+        let fee_total_u64 = u128_to_u64_checked(fee)?;
+        // Split 50/50. If odd, the extra base unit goes to creator.
+        let platform_fee_u64 = fee_total_u64 / 2;
+        let creator_fee_u64 = fee_total_u64
+            .checked_sub(platform_fee_u64)
+            .ok_or_else(|| error!(CurveError::MathOverflow))?;
         token::transfer(ctx.accounts.transfer_base_to_reserve(), cost_u64)?;
-        token::transfer(ctx.accounts.transfer_base_to_creator_escrow(), fee_u64)?;
+        if platform_fee_u64 > 0 {
+            token::transfer(ctx.accounts.transfer_base_to_platform_escrow(), platform_fee_u64)?;
+        }
+        if creator_fee_u64 > 0 {
+            token::transfer(ctx.accounts.transfer_base_to_creator_escrow(), creator_fee_u64)?;
+        }
 
         // Mint memecoins to buyer
         // Mint memecoins to buyer (PDA signer)
@@ -174,7 +189,7 @@ pub mod memecoin_curve {
 
         // Calculate creator fee on sell and net refund
         let fee_u128 = refund_u128
-            .checked_mul(ctx.accounts.memecoin.fee_bps as u128)
+            .checked_mul(TRADE_FEE_BPS_TOTAL as u128)
             .ok_or_else(|| error!(CurveError::MathOverflow))?
             .checked_div(10_000)
             .ok_or_else(|| error!(CurveError::MathOverflow))?;
@@ -191,7 +206,12 @@ pub mod memecoin_curve {
         require!(refund_net_u128 >= (min_refund as u128), CurveError::InvalidAmount);
         // Downcast checked to u64 for transfers
         let refund_net_u64 = u128_to_u64_checked(refund_net_u128)?;
-        let fee_u64 = u128_to_u64_checked(fee_u128)?;
+        let fee_total_u64 = u128_to_u64_checked(fee_u128)?;
+        // Split 50/50. If odd, the extra base unit goes to creator.
+        let platform_fee_u64 = fee_total_u64 / 2;
+        let creator_fee_u64 = fee_total_u64
+            .checked_sub(platform_fee_u64)
+            .ok_or_else(|| error!(CurveError::MathOverflow))?;
         let xfer_cpi = Transfer {
             from: ctx.accounts.reserve_vault.to_account_info(),
             to: ctx.accounts.seller_base_ata.to_account_info(),
@@ -211,20 +231,37 @@ pub mod memecoin_curve {
             refund_net_u64,
         )?;
 
-        // Transfer creator fee from reserve to creator escrow (PDA signer)
-        let xfer_fee_cpi = Transfer {
-            from: ctx.accounts.reserve_vault.to_account_info(),
-            to: ctx.accounts.creator_fee_vault.to_account_info(),
-            authority: ctx.accounts.memecoin.to_account_info(),
-        };
-        token::transfer(
-            CpiContext::new_with_signer(
-                ctx.accounts.token_program.to_account_info(),
-                xfer_fee_cpi,
-                &[&seeds],
-            ),
-            fee_u64,
-        )?;
+        // Transfer fees from reserve to platform/creator escrow (PDA signer)
+        if platform_fee_u64 > 0 {
+            let xfer_fee_cpi = Transfer {
+                from: ctx.accounts.reserve_vault.to_account_info(),
+                to: ctx.accounts.platform_fee_vault.to_account_info(),
+                authority: ctx.accounts.memecoin.to_account_info(),
+            };
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    xfer_fee_cpi,
+                    &[&seeds],
+                ),
+                platform_fee_u64,
+            )?;
+        }
+        if creator_fee_u64 > 0 {
+            let xfer_fee_cpi = Transfer {
+                from: ctx.accounts.reserve_vault.to_account_info(),
+                to: ctx.accounts.creator_fee_vault.to_account_info(),
+                authority: ctx.accounts.memecoin.to_account_info(),
+            };
+            token::transfer(
+                CpiContext::new_with_signer(
+                    ctx.accounts.token_program.to_account_info(),
+                    xfer_fee_cpi,
+                    &[&seeds],
+                ),
+                creator_fee_u64,
+            )?;
+        }
 
         // Update supply
         ctx.accounts.memecoin.supply = s0;
@@ -275,6 +312,46 @@ pub mod memecoin_curve {
             amount,
         )?;
 
+        Ok(())
+    }
+
+    /// Claim platform fees from the platform fee vault to any destination ATA.
+    pub fn claim_platform_fees(ctx: Context<ClaimPlatformFees>, amount: u64) -> Result<()> {
+        // Check platform authority signer matches stored authority
+        require_keys_eq!(
+            ctx.accounts.platform_authority.key(),
+            ctx.accounts.platform.authority,
+            CurveError::Unauthorized
+        );
+        require!(amount > 0, CurveError::InvalidAmount);
+
+        // Sanity: destination mint must match base mint
+        require_keys_eq!(
+            ctx.accounts.destination.mint,
+            ctx.accounts.base_mint.key(),
+            CurveError::InvalidParam
+        );
+
+        require!(
+            ctx.accounts.platform_fee_vault.amount >= amount,
+            CurveError::InsufficientFeeVault
+        );
+
+        // Move funds from platform fee vault to destination (platform PDA signs)
+        let seeds = [b"platform".as_ref(), &[ctx.accounts.platform.bump]];
+        let xfer_cpi = Transfer {
+            from: ctx.accounts.platform_fee_vault.to_account_info(),
+            to: ctx.accounts.destination.to_account_info(),
+            authority: ctx.accounts.platform.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new_with_signer(
+                ctx.accounts.token_program.to_account_info(),
+                xfer_cpi,
+                &[&seeds],
+            ),
+            amount,
+        )?;
         Ok(())
     }
 
@@ -555,6 +632,16 @@ pub struct CreateMemecoin<'info> {
     #[account(mut)]
     pub creator: Signer<'info>,
 
+    #[account(seeds = [b"platform"], bump = platform.bump)]
+    pub platform: Account<'info, Platform>,
+    #[account(
+        init_if_needed,
+        payer = creator,
+        associated_token::mint = base_mint,
+        associated_token::authority = platform,
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
+
     #[account(
         init,
         payer = creator,
@@ -622,6 +709,16 @@ pub struct BuyMemecoin<'info> {
     #[account(mut)]
     pub buyer: Signer<'info>,
 
+    #[account(seeds = [b"platform"], bump = platform.bump)]
+    pub platform: Account<'info, Platform>,
+    #[account(
+        init_if_needed,
+        payer = buyer,
+        associated_token::mint = base_mint,
+        associated_token::authority = platform,
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
+
     #[account(
         mut,
         seeds = [b"memecoin", memecoin.seed.as_ref()],
@@ -669,6 +766,15 @@ impl<'info> BuyMemecoin<'info> {
         CpiContext::new(self.token_program.to_account_info(), c)
     }
 
+    fn transfer_base_to_platform_escrow(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let c = Transfer {
+            from: self.buyer_base_ata.to_account_info(),
+            to: self.platform_fee_vault.to_account_info(),
+            authority: self.buyer.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), c)
+    }
+
     fn transfer_base_to_creator_escrow(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
         let c = Transfer {
             from: self.buyer_base_ata.to_account_info(),
@@ -683,6 +789,16 @@ impl<'info> BuyMemecoin<'info> {
 pub struct SellMemecoin<'info> {
     #[account(mut)]
     pub seller: Signer<'info>,
+
+    #[account(seeds = [b"platform"], bump = platform.bump)]
+    pub platform: Account<'info, Platform>,
+    #[account(
+        init_if_needed,
+        payer = seller,
+        associated_token::mint = base_mint,
+        associated_token::authority = platform,
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
 
     #[account(
         mut,
@@ -773,6 +889,33 @@ pub struct ClaimCreatorFees<'info> {
     pub creator_fee_vault: Account<'info, TokenAccount>,
 
     /// Destination ATA for base mint (can belong to real creator)
+    #[account(mut)]
+    pub destination: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct ClaimPlatformFees<'info> {
+    /// Platform authority must approve claims
+    pub platform_authority: Signer<'info>,
+
+    #[account(
+        seeds = [b"platform"],
+        bump = platform.bump,
+    )]
+    pub platform: Account<'info, Platform>,
+
+    #[account(mut)]
+    pub base_mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        associated_token::mint = base_mint,
+        associated_token::authority = platform,
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
+
+    /// Destination ATA for base mint (can belong to platform treasury)
     #[account(mut)]
     pub destination: Account<'info, TokenAccount>,
 
@@ -957,6 +1100,8 @@ pub enum CurveError {
     InsufficientFunds,
     #[msg("Insufficient reserve funds")] 
     InsufficientReserve,
+    #[msg("Insufficient fee vault balance")]
+    InsufficientFeeVault,
     #[msg("Unauthorized")] 
     Unauthorized,
     #[msg("Invalid state")]
