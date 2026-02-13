@@ -1,5 +1,6 @@
 use anchor_lang::prelude::*;
 use anchor_lang::solana_program::program_option::COption;
+use anchor_lang::solana_program::pubkey;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token::{
     self, Burn, Mint, MintTo, SetAuthority, Token, TokenAccount, Transfer,
@@ -12,17 +13,21 @@ declare_id!("BKWVgcPdNvYXUVBzfy17RDtSy7nvyxudUEF2yK34EYvu");
 // Trading fee: 1% total, split 50/50 between platform and uploader (creator).
 const TRADE_FEE_BPS_TOTAL: u16 = 100; // 1%
 
+// a2m_campaign_vault program id (must match `apps/ad2-meme/contracts/lib.rs`)
+const A2M_CAMPAIGN_VAULT_PROGRAM_ID: Pubkey = pubkey!("2s7V6oGMGMY2ys9y9FHBKt9HPvxqCUK2DpXEWegWzA8G");
+
 #[program]
 pub mod memecoin_curve {
     use super::*;
 
-    /// Create a new memecoin with a linear bonding curve: price(s) = a + b*s
-    /// - `a` and `b` are denominated in base token units per memecoin unit
-    /// - `decimals` configures the memecoin mint decimals
-    /// - `seed` is an arbitrary 32-byte discriminator (e.g., image hash)
-    pub fn create_memecoin(
-        ctx: Context<CreateMemecoin>,
-        seed: [u8; 32],
+    /// Create the **campaign coin** for a specific `a2m_campaign_vault` campaign.
+    ///
+    /// This replaces the old "per-meme memecoin" creation flow:
+    /// - only **one coin per campaign** (seed = campaign PDA pubkey bytes)
+    /// - only the campaign advertiser may create it (must sign + provide the correct campaign PDA)
+    pub fn create_campaign_coin(
+        ctx: Context<CreateCampaignCoin>,
+        campaign_id: u64,
         a: u64,
         b: u64,
         fee_bps: u16,
@@ -30,6 +35,32 @@ pub mod memecoin_curve {
     ) -> Result<()> {
         // Fee is fixed (prevents per-memecoin fee mismatch across UI/backends).
         require!(fee_bps == TRADE_FEE_BPS_TOTAL, CurveError::InvalidParam);
+
+        // ---- Campaign authorization ----
+        // Require the provided campaign account to be the canonical PDA for:
+        //   seeds = ["campaign", advertiser_pubkey, campaign_id_le]
+        // under the a2m_campaign_vault program id.
+        let campaign_info = ctx.accounts.campaign.to_account_info();
+        require!(!campaign_info.data_is_empty(), CurveError::InvalidCampaign);
+        require!(campaign_info.owner == &A2M_CAMPAIGN_VAULT_PROGRAM_ID, CurveError::InvalidCampaign);
+
+        let (expected_campaign, _) = Pubkey::find_program_address(
+            &[
+                b"campaign",
+                ctx.accounts.creator.key().as_ref(),
+                &campaign_id.to_le_bytes(),
+            ],
+            &A2M_CAMPAIGN_VAULT_PROGRAM_ID,
+        );
+        require_keys_eq!(
+            ctx.accounts.campaign.key(),
+            expected_campaign,
+            CurveError::InvalidCampaign
+        );
+
+        // One-coin-per-campaign: seed is campaign pubkey bytes.
+        let seed: [u8; 32] = ctx.accounts.campaign.key().to_bytes();
+
         let state = &mut ctx.accounts.memecoin;
         state.bump = ctx.bumps.memecoin;
         state.seed = seed;
@@ -51,7 +82,7 @@ pub mod memecoin_curve {
 
     /// Transfer the memecoin mint authority from the creator to the memecoin PDA.
     /// Intended flow:
-    /// 1) `create_memecoin` initializes the mint with `creator` as temporary mint authority
+    /// 1) `create_campaign_coin` initializes the mint with `creator` as temporary mint authority
     /// 2) client creates Metaplex metadata directly (mint authority = creator)
     /// 3) client calls `handoff_mint_authority` so `buy_memecoin` can mint (mint authority = memecoin PDA)
     pub fn handoff_mint_authority(ctx: Context<HandoffMintAuthority>) -> Result<()> {
@@ -627,10 +658,17 @@ impl LiquidityDefaults {
 /* -------------------- Accounts -------------------- */
 
 #[derive(Accounts)]
-#[instruction(seed: [u8; 32], a: u64, b: u64, fee_bps: u16, decimals: u8)]
-pub struct CreateMemecoin<'info> {
+#[instruction(campaign_id: u64, a: u64, b: u64, fee_bps: u16, decimals: u8)]
+pub struct CreateCampaignCoin<'info> {
     #[account(mut)]
     pub creator: Signer<'info>,
+
+    /// Campaign account from the `a2m_campaign_vault` program.
+    ///
+    /// Verified in-handler:
+    /// - owner == `A2M_CAMPAIGN_VAULT_PROGRAM_ID`
+    /// - key == PDA(["campaign", creator_pubkey, campaign_id_le], A2M_CAMPAIGN_VAULT_PROGRAM_ID)
+    pub campaign: UncheckedAccount<'info>,
 
     #[account(seeds = [b"platform"], bump = platform.bump)]
     pub platform: Account<'info, Platform>,
@@ -646,7 +684,7 @@ pub struct CreateMemecoin<'info> {
         init,
         payer = creator,
         space = 8 + Memecoin::LEN,
-        seeds = [b"memecoin", seed.as_ref()],
+        seeds = [b"memecoin", campaign.key().as_ref()],
         bump,
     )]
     pub memecoin: Account<'info, Memecoin>,
@@ -673,7 +711,7 @@ pub struct CreateMemecoin<'info> {
     #[account(
         init,
         payer = creator,
-        seeds = [b"creator_fee_vault", seed.as_ref()],
+        seeds = [b"creator_fee_vault", campaign.key().as_ref()],
         bump,
         token::mint = base_mint,
         token::authority = memecoin,
@@ -1094,6 +1132,8 @@ pub enum CurveError {
     InvalidParam,
     #[msg("Invalid amount")] 
     InvalidAmount,
+    #[msg("Invalid campaign")] 
+    InvalidCampaign,
     #[msg("Math overflow")] 
     MathOverflow,
     #[msg("Insufficient buyer funds")] 
