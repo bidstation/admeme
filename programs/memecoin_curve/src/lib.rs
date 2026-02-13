@@ -663,9 +663,8 @@ pub struct CreateCampaignCoin<'info> {
     #[account(mut)]
     pub creator: Signer<'info>,
 
-    /// Campaign account from the `a2m_campaign_vault` program.
-    ///
-    /// Verified in-handler:
+    /// CHECK: This account belongs to the external `a2m_campaign_vault` program and is intentionally
+    /// unchecked here. It is verified in-handler by checking:
     /// - owner == `A2M_CAMPAIGN_VAULT_PROGRAM_ID`
     /// - key == PDA(["campaign", creator_pubkey, campaign_id_le], A2M_CAMPAIGN_VAULT_PROGRAM_ID)
     pub campaign: UncheckedAccount<'info>,
