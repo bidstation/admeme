@@ -7,7 +7,7 @@ Public repository for the **AdMeme** on-chain programs (Rust + Anchor). This rep
 | Program | Crate name | Path in this repo | Purpose |
 | --- | --- | --- | --- |
 | **a2m_campaign_vault** | `a2m_campaign_vault` | `./programs/a2m_campaign_vault/src/lib.rs` | Campaign vault + Merkle-based payouts for advertisers. |
-| **memecoin_curve** | `memecoin_curve` | `./programs/memecoin-curve/src/lib.rs` | Per-meme token with a linear bonding curve (buy/sell) + fee escrow and optional reserve management. |
+| **collection_coin_curve_v2** | `collection_coin_curve_v2` | `./programs/collection_coin_curve_v2/src/lib.rs` | Per-collection token with a bonding curve (buy/sell) + fee escrow. |
 
 ## a2m_campaign_vault
 
@@ -28,39 +28,9 @@ Campaign vault that holds an advertiser-funded SPL token balance and pays recipi
 **Merkle leaf format**
 - `leaf = H("A2M_CLAIM" || campaign_pubkey || email_hash || amount_le || index_le)` using Solana `hashv`
 
-## memecoin_curve
+## collection_coin_curve_v2
 
-Creates per-meme SPL token mints governed by a **linear bonding curve**:
-
-- Price model: `p(s) = a + b*s`
-- Buy: pay the integral cost over `[s, s + amount_out]` plus a creator fee
-- Sell: burn tokens and receive the integral refund over `[s - amount_in, s]` net of fee
-- Slippage protection: buyers pass `max_total`; sellers pass `min_refund`
-
-**Core flow**
-1. `create_memecoin(seed, a, b, fee_bps, decimals)` - creates `Memecoin` PDA state, initializes the memecoin mint (temporary mint authority = creator), and creates vaults.
-2. (Optional) create Metaplex metadata while the creator is mint authority.
-3. `handoff_mint_authority()` - transfers mint authority to the `Memecoin` PDA so curve buys can mint.
-4. Trading: `buy_memecoin(amount_out, max_total)` / `sell_memecoin(amount_in, min_refund)`.
-
-**Fees**
-- `fee_bps` is in basis points (`0..=10_000`).
-- Buy fees are transferred into `creator_fee_vault`.
-- Sell fees are transferred from `reserve_vault` into `creator_fee_vault`.
-- `claim_creator_fees(amount)` moves funds from `creator_fee_vault` to a destination token account, gated by the platform authority.
-
-**Reserve management (optional)**
-- Global per-`base_mint` configuration via `init_liquidity_defaults(...)` / `update_liquidity_defaults(...)`.
-- `sweep_excess()` can move excess base tokens from `reserve_vault` to a configured destination when enabled.
-- `finalize_disable_curve()` permanently disables curve trading once the reserve reaches the configured threshold.
-- After finalization: `revoke_mint_authorities()` (creator or platform) and `withdraw_finalized_reserve()` (creator).
-
-**Key PDAs / accounts**
-- `memecoin`: seeds `["memecoin", seed]`
-- `platform`: seeds `["platform"]`
-- `liquidity_defaults`: seeds `["liquidity_defaults", base_mint_pubkey]`
-- `reserve_vault`: associated token account for `base_mint`, authority = `memecoin`
-- `creator_fee_vault`: seeds `["creator_fee_vault", seed]` (SPL token account for `base_mint`, authority = `memecoin`)
+Creates per-collection SPL token mints governed by a **bonding curve**:
 
 ## Program IDs
 
@@ -69,7 +39,7 @@ Program IDs are declared in-source via `declare_id!()` and must be updated to ma
 | Program | Program ID |
 | --- | --- |
 | `a2m_campaign_vault` | `2s7V6oGMGMY2ys9y9FHBKt9HPvxqCUK2DpXEWegWzA8G` |
-| `memecoin_curve` | `BKWVgcPdNvYXUVBzfy17RDtSy7nvyxudUEF2yK34EYvu` |
+| `collection_coin_curve_v2` | `FUAYEMXuFbmEyCu215fqH4G5Q2jSjQUBJvPPJJSQDMZj` |
 
 ## Building
 
@@ -82,8 +52,8 @@ These are Anchor programs (`anchor-lang` `0.32.1`).
 # a2m_campaign_vault
 cargo build-sbf --manifest-path ./Cargo.toml
 
-# memecoin_curve
-cargo build-sbf --manifest-path ./memecoin-curve/Cargo.toml
+# collection_coin_curve_v2
+cargo build-sbf --manifest-path ./collection_coin_curve_v2/Cargo.toml
 ```
 
 ## Security
