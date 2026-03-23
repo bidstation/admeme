@@ -8,15 +8,14 @@ declare_id!("2s7V6oGMGMY2ys9y9FHBKt9HPvxqCUK2DpXEWegWzA8G");
 // ---- Campaign pricing / fee config (hardcoded on-chain) ----
 // 3% platform fee, taken upfront from advertiser deposits. Non-refundable.
 const PLATFORM_FEE_BPS: u16 = 300;
-// Allowed campaign mints (mainnet)
+// Allowed campaign mint (mainnet)
 const A2M_MINT: Pubkey = Pubkey::new_from_array([
     159, 225, 109, 36, 121, 224, 103, 249, 55, 248, 48, 63, 243, 61, 85, 239,
     165, 118, 169, 247, 32, 26, 100, 112, 88, 16, 215, 48, 197, 158, 140, 20,
 ]);
-const USDC_MINT: Pubkey = Pubkey::new_from_array([
-    198, 250, 122, 243, 190, 219, 173, 58, 61, 101, 243, 106, 171, 201, 116, 49,
-    177, 187, 228, 194, 210, 246, 224, 228, 124, 166, 2, 3, 69, 47, 93, 97,
-]);
+// Claims registry rent grows linearly with the number of leaves because each leaf
+// consumes one bit in the claimed bitmap. Keep the PDA size bounded.
+const MAX_CLAIMS_LEAF_COUNT: u32 = 10_000;
 
 #[program]
 pub mod a2m_campaign_vault {
@@ -36,9 +35,9 @@ pub mod a2m_campaign_vault {
         campaign_id: u64,
         advertiser_deposit_amount: u64,
     ) -> Result<()> {
-        // Restrict to supported tokens only (prevents locking funds in unsupported mints).
+        // Restrict rounds to A2M only.
         let mint = ctx.accounts.mint.key();
-        require!(mint == A2M_MINT || mint == USDC_MINT, ErrCode::InvalidMint);
+        require!(mint == A2M_MINT, ErrCode::InvalidMint);
 
         // init state
         {
@@ -53,17 +52,20 @@ pub mod a2m_campaign_vault {
             c.id = campaign_id;
         }
 
-        // optional initial advertiser funding
-        if advertiser_deposit_amount > 0 {
-            // Fee is calculated from gross deposit (floor division, base units)
-            let fee = ((advertiser_deposit_amount as u128)
+        let fee = if advertiser_deposit_amount > 0 {
+            ((advertiser_deposit_amount as u128)
                 .checked_mul(PLATFORM_FEE_BPS as u128)
                 .ok_or(ErrCode::MathOverflow)?
-                / 10_000u128) as u64;
-            let net = advertiser_deposit_amount
-                .checked_sub(fee)
-                .ok_or(ErrCode::MathOverflow)?;
+                / 10_000u128) as u64
+        } else {
+            0
+        };
+        let net = advertiser_deposit_amount
+            .checked_sub(fee)
+            .ok_or(ErrCode::MathOverflow)?;
 
+        // optional initial advertiser funding
+        if advertiser_deposit_amount > 0 {
             // Transfer fee to platform fee vault (ATA owned by platform PDA)
             if fee > 0 {
                 token::transfer(
@@ -81,6 +83,17 @@ pub mod a2m_campaign_vault {
             // Record gross deposit for off-chain impressions math
             ctx.accounts.campaign.advertiser_deposit = advertiser_deposit_amount;
         }
+
+        emit!(CampaignInitialized {
+            campaign: ctx.accounts.campaign.key(),
+            campaign_id,
+            advertiser: ctx.accounts.advertiser.key(),
+            mint,
+            gross_deposit: advertiser_deposit_amount,
+            fee,
+            net_deposit: net,
+        });
+
         Ok(())
     }
 
@@ -104,6 +117,13 @@ pub mod a2m_campaign_vault {
                 .with_signer(&[seeds]),
             amount,
         )?;
+
+        emit!(FeesWithdrawn {
+            mint: ctx.accounts.mint.key(),
+            recipient: ctx.accounts.recipient.key(),
+            amount,
+        });
+
         Ok(())
     }
 
@@ -114,12 +134,16 @@ pub mod a2m_campaign_vault {
         claims_leaf_count: u32,
         ap_total_payout: u64,   // cap for advertiser-pool payouts
     ) -> Result<()> {
-        // ---- Auth: advertiser or platform ----
-        let adv_ok = ctx.accounts.advertiser.as_ref().map(|s| s.key())
-            == Some(ctx.accounts.campaign.advertiser);
-        let plat_ok = ctx.accounts.platform_signer.as_ref().map(|s| s.key())
-            == Some(ctx.accounts.platform.authority);
-        require!(adv_ok || plat_ok, ErrCode::NotAuthorized);
+        // ---- Auth: platform only ----
+        require_keys_eq!(
+            ctx.accounts
+                .platform_signer
+                .as_ref()
+                .ok_or(ErrCode::NotAuthorized)?
+                .key(),
+            ctx.accounts.platform.authority,
+            ErrCode::NotAuthorized
+        );
 
         // ---- Campaign must be open ----
         let c = &mut ctx.accounts.campaign;
@@ -128,8 +152,9 @@ pub mod a2m_campaign_vault {
         // ---- Vault must cover payout cap ----
         let needed = ap_total_payout;
         require!(ctx.accounts.vault.amount >= needed, ErrCode::InsufficientVault);
+        require!(claims_leaf_count <= MAX_CLAIMS_LEAF_COUNT, ErrCode::TooManyClaims);
 
-        // ---- Init (or overwrite) the two registries ----
+        // ---- Initialize the claims registry ----
         {
             let reg = &mut ctx.accounts.claims;
             reg.campaign = c.key();
@@ -142,24 +167,38 @@ pub mod a2m_campaign_vault {
         c.ap_total_payout = ap_total_payout;
         c.status = Status::Finalized;
 
+        emit!(CampaignFinalized {
+            campaign: c.key(),
+            claims_root,
+            claims_leaf_count,
+            ap_total_payout,
+        });
+
         Ok(())
     }
 
-    /* -------------------- Claim: advertiser pool (unchanged flow) -------------------- */
-
-    pub fn claim(
+    pub fn claim_email_v2(
         ctx: Context<Claim>,
         email_hash: [u8; 32],
+        wallet_pubkey: Pubkey,
         amount: u64,
         index: u32,
         proof: Vec<[u8; 32]>,
     ) -> Result<()> {
-        // Platform co-sign
+        // Platform co-sign is the strict fallback path for email-only v2 claims.
         require_keys_eq!(
             ctx.accounts.platform_signer.key(),
             ctx.accounts.platform.authority,
             ErrCode::NotAuthorized
         );
+        require!(
+            wallet_pubkey == Pubkey::default(),
+            ErrCode::WalletBoundClaimRequiresWalletSigner
+        );
+
+        let campaign = ctx.accounts.campaign.key();
+        let recipient = ctx.accounts.recipient.key();
+        let mut ap_total_claimed = 0u64;
 
         {
             let c_ro = &ctx.accounts.campaign;
@@ -170,16 +209,19 @@ pub mod a2m_campaign_vault {
             require!((index as u64) < (reg_ro.leaf_count as u64), ErrCode::IndexOutOfBounds);
             require!(!bitmap_get(&reg_ro.claimed_bitmap, index), ErrCode::AlreadyClaimed);
 
-            // Verify Merkle leaf for advertiser pool claims
-            // Domain: "A2M_CLAIM"
-            let leaf = hash_leaf(b"A2M_CLAIM", &c_ro.key(), &email_hash, amount, index);
+            let leaf = hash_leaf_v2(
+                b"A2M_CLAIM_V2",
+                &c_ro.key(),
+                &email_hash,
+                &wallet_pubkey,
+                amount,
+                index,
+            );
             require!(verify_merkle(leaf, &proof, index, &reg_ro.root), ErrCode::InvalidMerkleProof);
 
-            // Cap enforcement
             let new_claimed = c_ro.ap_total_claimed.checked_add(amount).ok_or(ErrCode::MathOverflow)?;
             require!(new_claimed <= c_ro.ap_total_payout, ErrCode::PayoutExceeded);
 
-            // CPI transfer with campaign as signer
             let adv = c_ro.advertiser;
             let id_bytes = c_ro.id.to_le_bytes();
             let bump = c_ro.vault_bump;
@@ -191,7 +233,6 @@ pub mod a2m_campaign_vault {
                 amount,
             )?;
 
-            // Mark claimed & update tally
             {
                 let reg = &mut ctx.accounts.claims;
                 bitmap_set(&mut reg.claimed_bitmap, index);
@@ -200,7 +241,89 @@ pub mod a2m_campaign_vault {
                 let c = &mut ctx.accounts.campaign;
                 c.ap_total_claimed = new_claimed;
             }
+            ap_total_claimed = new_claimed;
         }
+
+        emit!(ClaimSettled {
+            campaign,
+            index,
+            amount,
+            recipient,
+            claim_kind: ClaimKind::EmailV2,
+            ap_total_claimed,
+        });
+
+        Ok(())
+    }
+
+    pub fn claim_wallet(
+        ctx: Context<ClaimWallet>,
+        email_hash: [u8; 32],
+        amount: u64,
+        index: u32,
+        proof: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let campaign = ctx.accounts.campaign.key();
+        let recipient = ctx.accounts.claimant.key();
+        let mut ap_total_claimed = 0u64;
+
+        {
+            let c_ro = &ctx.accounts.campaign;
+            require!(c_ro.status == Status::Finalized, ErrCode::NotFinalized);
+
+            let reg_ro = &ctx.accounts.claims;
+            require_keys_eq!(reg_ro.campaign, c_ro.key(), ErrCode::InvalidRegistry);
+            require!((index as u64) < (reg_ro.leaf_count as u64), ErrCode::IndexOutOfBounds);
+            require!(!bitmap_get(&reg_ro.claimed_bitmap, index), ErrCode::AlreadyClaimed);
+
+            let claimant = ctx.accounts.claimant.key();
+            require!(
+                claimant != Pubkey::default(),
+                ErrCode::WalletBoundClaimRequiresWalletSigner
+            );
+            let leaf = hash_leaf_v2(
+                b"A2M_CLAIM_V2",
+                &c_ro.key(),
+                &email_hash,
+                &claimant,
+                amount,
+                index,
+            );
+            require!(verify_merkle(leaf, &proof, index, &reg_ro.root), ErrCode::InvalidMerkleProof);
+
+            let new_claimed = c_ro.ap_total_claimed.checked_add(amount).ok_or(ErrCode::MathOverflow)?;
+            require!(new_claimed <= c_ro.ap_total_payout, ErrCode::PayoutExceeded);
+
+            let adv = c_ro.advertiser;
+            let id_bytes = c_ro.id.to_le_bytes();
+            let bump = c_ro.vault_bump;
+            let seeds: &[&[u8]] = &[b"campaign", adv.as_ref(), &id_bytes, &[bump]];
+            token::transfer(
+                ctx.accounts
+                    .transfer_from_vault_to_claimant()
+                    .with_signer(&[seeds]),
+                amount,
+            )?;
+
+            {
+                let reg = &mut ctx.accounts.claims;
+                bitmap_set(&mut reg.claimed_bitmap, index);
+            }
+            {
+                let c = &mut ctx.accounts.campaign;
+                c.ap_total_claimed = new_claimed;
+            }
+            ap_total_claimed = new_claimed;
+        }
+
+        emit!(ClaimSettled {
+            campaign,
+            index,
+            amount,
+            recipient,
+            claim_kind: ClaimKind::WalletV2,
+            ap_total_claimed,
+        });
 
         Ok(())
     }
@@ -243,6 +366,12 @@ pub enum Status {
     Finalized,
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimKind {
+    EmailV2,
+    WalletV2,
+}
+
 /// Registry used for advertiser pool payouts
 #[account]
 pub struct ClaimsRegistry {
@@ -253,7 +382,8 @@ pub struct ClaimsRegistry {
 }
 impl ClaimsRegistry {
     pub fn space(leaf_count: u32) -> usize {
-        let bitmap_len = ((leaf_count as usize) + 7) / 8;
+        let capped_leaf_count = core::cmp::min(leaf_count, MAX_CLAIMS_LEAF_COUNT) as usize;
+        let bitmap_len = (capped_leaf_count + 7) / 8;
         8 + 32 + 32 + 4 + 4 + bitmap_len
     }
 }
@@ -356,7 +486,8 @@ impl<'info> InitCampaign<'info> {
     ap_total_payout: u64
 )]
 pub struct Finalize<'info> {
-    // Either advertiser or platform signs (optional)
+    // Kept optional for account-layout compatibility, but finalize requires the
+    // platform signer at runtime.
     #[account(mut)]
     pub advertiser: Option<Signer<'info>>,
     #[account(mut)]
@@ -460,6 +591,59 @@ impl<'info> Claim<'info> {
     }
 }
 
+#[derive(Accounts)]
+pub struct ClaimWallet<'info> {
+    #[account(mut)]
+    pub claimant: Signer<'info>,
+    #[account(
+        init_if_needed,
+        payer = claimant,
+        associated_token::mint = mint,
+        associated_token::authority = claimant
+    )]
+    pub claimant_ata: Account<'info, TokenAccount>,
+
+    pub mint: Account<'info, Mint>,
+    #[account(
+        mut,
+        seeds = [b"campaign", campaign.advertiser.as_ref(), &campaign.id.to_le_bytes()],
+        bump = campaign.vault_bump,
+        constraint = campaign.mint == mint.key(),
+    )]
+    pub campaign: Account<'info, Campaign>,
+
+    #[account(
+        mut,
+        constraint = vault.owner == campaign.key(),
+        constraint = vault.mint == mint.key(),
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"claims", campaign.key().as_ref()],
+        bump,
+        constraint = claims.campaign == campaign.key()
+    )]
+    pub claims: Account<'info, ClaimsRegistry>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, anchor_lang::system_program::System>,
+}
+impl<'info> ClaimWallet<'info> {
+    fn transfer_from_vault_to_claimant(
+        &self,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let c = Transfer {
+            from: self.vault.to_account_info(),
+            to: self.claimant_ata.to_account_info(),
+            authority: self.campaign.to_account_info(),
+        };
+        CpiContext::new(self.token_program.to_account_info(), c)
+    }
+}
+
 /* ------ Withdraw platform fees ------ */
 
 #[derive(Accounts)]
@@ -510,7 +694,42 @@ impl<'info> WithdrawFees<'info> {
 // (Booster claim instruction/accounts removed)
 
 /* ------------ Events ------------ */
-// (Boosted event removed)
+
+#[event]
+pub struct CampaignInitialized {
+    pub campaign: Pubkey,
+    pub campaign_id: u64,
+    pub advertiser: Pubkey,
+    pub mint: Pubkey,
+    pub gross_deposit: u64,
+    pub fee: u64,
+    pub net_deposit: u64,
+}
+
+#[event]
+pub struct CampaignFinalized {
+    pub campaign: Pubkey,
+    pub claims_root: [u8; 32],
+    pub claims_leaf_count: u32,
+    pub ap_total_payout: u64,
+}
+
+#[event]
+pub struct ClaimSettled {
+    pub campaign: Pubkey,
+    pub index: u32,
+    pub amount: u64,
+    pub recipient: Pubkey,
+    pub claim_kind: ClaimKind,
+    pub ap_total_claimed: u64,
+}
+
+#[event]
+pub struct FeesWithdrawn {
+    pub mint: Pubkey,
+    pub recipient: Pubkey,
+    pub amount: u64,
+}
 
 /* ------------ Errors ------------ */
 
@@ -540,6 +759,10 @@ pub enum ErrCode {
     InvalidAmount,
     #[msg("Invalid mint")]
     InvalidMint,
+    #[msg("Too many claims in one registry")]
+    TooManyClaims,
+    #[msg("Wallet-bound claims must be claimed by the bound wallet signer")]
+    WalletBoundClaimRequiresWalletSigner,
 }
 
 /* ------------ Helpers ------------ */
@@ -558,12 +781,17 @@ fn bitmap_set(bits: &mut [u8], idx: u32) {
     }
 }
 
-/// Domain-separated leaf:
-/// H( domain || campaign_pubkey || user_hash || amount_le || index_le )
-fn hash_leaf(domain: &[u8], campaign: &Pubkey, user_hash: &[u8;32], amount: u64, index: u32) -> [u8;32] {
+fn hash_leaf_v2(
+    domain: &[u8],
+    campaign: &Pubkey,
+    user_hash: &[u8; 32],
+    wallet: &Pubkey,
+    amount: u64,
+    index: u32,
+) -> [u8; 32] {
     let amt = amount.to_le_bytes();
     let idx = index.to_le_bytes();
-    hashv(&[domain, campaign.as_ref(), user_hash, &amt, &idx]).to_bytes()
+    hashv(&[domain, campaign.as_ref(), user_hash, wallet.as_ref(), &amt, &idx]).to_bytes()
 }
 
 /// Indexed Merkle verification (right = odd, left = even).
