@@ -1,7 +1,8 @@
 [workspace]
 members = [
     "programs/a2m_campaign_vault",
-    "programs/memecoin_curve"
+    "programs/memecoin_curve",
+    "programs/collection_coin_curve_v2"
 ]
 resolver = "2"
 

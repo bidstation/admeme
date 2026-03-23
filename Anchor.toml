@@ -9,6 +9,7 @@ skip-lint = false
 [programs.mainnet]
 a2m_campaign_vault = "2s7V6oGMGMY2ys9y9FHBKt9HPvxqCUK2DpXEWegWzA8G"
 memecoin_curve = "BKWVgcPdNvYXUVBzfy17RDtSy7nvyxudUEF2yK34EYvu"
+collection_coin_curve_v2 = "FUAYEMXuFbmEyCu215fqH4G5Q2jSjQUBJvPPJJSQDMZj"
 
 [registry]
 url = "https://api.apr.dev"
