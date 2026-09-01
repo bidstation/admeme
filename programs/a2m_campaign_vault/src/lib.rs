@@ -16,6 +16,10 @@ const A2M_MINT: Pubkey = Pubkey::new_from_array([
 // Claims registry rent grows linearly with the number of leaves because each leaf
 // consumes one bit in the claimed bitmap. Keep the PDA size bounded.
 const MAX_CLAIMS_LEAF_COUNT: u32 = 10_000;
+const COMMUNITY_RULES_VERSION: u16 = 1;
+const COMMUNITY_MIN_FUNDING_SECONDS: i64 = 60;
+const COMMUNITY_MAX_FUNDING_SECONDS: i64 = 30 * 24 * 60 * 60;
+const COMMUNITY_MAX_REVIEW_SECONDS: u64 = 24 * 60 * 60;
 
 #[program]
 pub mod a2m_campaign_vault {
@@ -92,6 +96,198 @@ pub mod a2m_campaign_vault {
             gross_deposit: advertiser_deposit_amount,
             fee,
             net_deposit: net,
+        });
+
+        Ok(())
+    }
+
+    /// Opt an open campaign into community funding and register the
+    /// advertiser's existing deposit as the first contribution. This is kept
+    /// separate from `init_campaign` so existing solo-round transactions and
+    /// account layouts remain fully backward compatible.
+    pub fn init_community_round(
+        ctx: Context<InitCommunityRound>,
+        funding_deadline: i64,
+        creator_reward_bps: u16,
+        voter_reward_bps: u16,
+        max_reward_voters: u32,
+        max_winners: u16,
+        requested_active_duration: u64,
+        review_duration: u64,
+        quorum_bps: u16,
+        rules_version: u16,
+        terms_hash: [u8; 32],
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let campaign = &ctx.accounts.campaign;
+        require!(campaign.status == Status::Open, ErrCode::AlreadyFinalized);
+        require_keys_eq!(campaign.advertiser, ctx.accounts.advertiser.key(), ErrCode::NotAuthorized);
+        require_keys_eq!(campaign.mint, A2M_MINT, ErrCode::InvalidMint);
+        require!(campaign.advertiser_deposit > 0, ErrCode::InvalidAmount);
+        let funding_window = funding_deadline
+            .checked_sub(now)
+            .ok_or(ErrCode::InvalidFundingDeadline)?;
+        require!(
+            funding_window >= COMMUNITY_MIN_FUNDING_SECONDS
+                && funding_window <= COMMUNITY_MAX_FUNDING_SECONDS,
+            ErrCode::InvalidFundingDeadline
+        );
+        require!(
+            review_duration > 0 && review_duration <= COMMUNITY_MAX_REVIEW_SECONDS,
+            ErrCode::InvalidCommunityTerms
+        );
+        require!(quorum_bps <= 10_000, ErrCode::InvalidCommunityTerms);
+        require!(rules_version == COMMUNITY_RULES_VERSION, ErrCode::InvalidCommunityTerms);
+        require!(
+            max_reward_voters == 0 || max_reward_voters <= MAX_CLAIMS_LEAF_COUNT,
+            ErrCode::TooManyClaims
+        );
+        require!(
+            creator_reward_bps
+                .checked_add(voter_reward_bps)
+                .ok_or(ErrCode::MathOverflow)?
+                == 10_000,
+            ErrCode::InvalidCommunityTerms
+        );
+
+        let expected_terms_hash = hash_community_terms(
+            campaign.id,
+            funding_deadline,
+            creator_reward_bps,
+            voter_reward_bps,
+            max_reward_voters,
+            max_winners,
+            requested_active_duration,
+            review_duration,
+            quorum_bps,
+            rules_version,
+        );
+        require!(terms_hash == expected_terms_hash, ErrCode::InvalidCommunityTermsHash);
+
+        let initial_gross = campaign.advertiser_deposit;
+        let initial_fee = fee_for_amount(initial_gross)?;
+        let initial_net = initial_gross
+            .checked_sub(initial_fee)
+            .ok_or(ErrCode::MathOverflow)?;
+
+        let community = &mut ctx.accounts.community;
+        community.campaign = campaign.key();
+        community.initiator = ctx.accounts.advertiser.key();
+        community.funding_deadline = funding_deadline;
+        community.total_gross = initial_gross;
+        community.total_net = initial_net;
+        community.contributor_count = 1;
+        community.creator_reward_bps = creator_reward_bps;
+        community.voter_reward_bps = voter_reward_bps;
+        community.max_reward_voters = max_reward_voters;
+        community.max_winners = max_winners;
+        community.requested_active_duration = requested_active_duration;
+        community.review_duration = review_duration;
+        community.quorum_bps = quorum_bps;
+        community.rules_version = rules_version;
+        community.terms_hash = terms_hash;
+        community.bump = ctx.bumps.community;
+
+        let contribution = &mut ctx.accounts.starter_contribution;
+        contribution.campaign = campaign.key();
+        contribution.funder = ctx.accounts.advertiser.key();
+        contribution.gross_amount = initial_gross;
+        contribution.net_amount = initial_net;
+        contribution.contribution_count = 1;
+        contribution.bump = ctx.bumps.starter_contribution;
+
+        emit!(CommunityRoundInitialized {
+            campaign: campaign.key(),
+            initiator: ctx.accounts.advertiser.key(),
+            funding_deadline,
+            initial_gross,
+            initial_net,
+            terms_hash,
+        });
+
+        Ok(())
+    }
+
+    /// Add an irrevocable A2M contribution before the community funding
+    /// deadline. Every contribution pays the same platform fee as the starter
+    /// deposit, and voting power is recorded from the net amount held by the
+    /// campaign vault.
+    pub fn contribute(ctx: Context<Contribute>, gross_amount: u64) -> Result<()> {
+        require!(gross_amount > 0, ErrCode::InvalidAmount);
+        require!(ctx.accounts.campaign.status == Status::Open, ErrCode::AlreadyFinalized);
+        require_keys_eq!(ctx.accounts.campaign.mint, A2M_MINT, ErrCode::InvalidMint);
+        require!(
+            Clock::get()?.unix_timestamp < ctx.accounts.community.funding_deadline,
+            ErrCode::FundingClosed
+        );
+
+        let fee = fee_for_amount(gross_amount)?;
+        let net = gross_amount
+            .checked_sub(fee)
+            .ok_or(ErrCode::MathOverflow)?;
+
+        if fee > 0 {
+            token::transfer(ctx.accounts.transfer_from_funder_to_platform_fee_vault(), fee)?;
+        }
+        if net > 0 {
+            token::transfer(ctx.accounts.transfer_from_funder_to_vault(), net)?;
+        }
+
+        let contribution = &mut ctx.accounts.contribution;
+        let is_new_contributor = contribution.contribution_count == 0;
+        if is_new_contributor {
+            contribution.campaign = ctx.accounts.campaign.key();
+            contribution.funder = ctx.accounts.funder.key();
+            contribution.bump = ctx.bumps.contribution;
+        } else {
+            require_keys_eq!(
+                contribution.campaign,
+                ctx.accounts.campaign.key(),
+                ErrCode::InvalidContribution
+            );
+            require_keys_eq!(
+                contribution.funder,
+                ctx.accounts.funder.key(),
+                ErrCode::InvalidContribution
+            );
+        }
+        contribution.gross_amount = contribution
+            .gross_amount
+            .checked_add(gross_amount)
+            .ok_or(ErrCode::MathOverflow)?;
+        contribution.net_amount = contribution
+            .net_amount
+            .checked_add(net)
+            .ok_or(ErrCode::MathOverflow)?;
+        contribution.contribution_count = contribution
+            .contribution_count
+            .checked_add(1)
+            .ok_or(ErrCode::MathOverflow)?;
+
+        let community = &mut ctx.accounts.community;
+        community.total_gross = community
+            .total_gross
+            .checked_add(gross_amount)
+            .ok_or(ErrCode::MathOverflow)?;
+        community.total_net = community
+            .total_net
+            .checked_add(net)
+            .ok_or(ErrCode::MathOverflow)?;
+        if is_new_contributor {
+            community.contributor_count = community
+                .contributor_count
+                .checked_add(1)
+                .ok_or(ErrCode::MathOverflow)?;
+        }
+
+        emit!(CommunityContributionAdded {
+            campaign: ctx.accounts.campaign.key(),
+            funder: ctx.accounts.funder.key(),
+            gross_amount,
+            fee,
+            net_amount: net,
+            funder_total_net: contribution.net_amount,
+            community_total_net: community.total_net,
         });
 
         Ok(())
@@ -366,6 +562,46 @@ pub enum Status {
     Finalized,
 }
 
+/// Immutable community-round terms plus aggregate confirmed funding. It is an
+/// auxiliary PDA so the deployed `Campaign` account layout does not change.
+#[account]
+pub struct CommunityRound {
+    pub campaign: Pubkey,
+    pub initiator: Pubkey,
+    pub funding_deadline: i64,
+    pub total_gross: u64,
+    pub total_net: u64,
+    pub contributor_count: u32,
+    pub creator_reward_bps: u16,
+    pub voter_reward_bps: u16,
+    pub max_reward_voters: u32,
+    /// Zero means that every positively scored candidate may win.
+    pub max_winners: u16,
+    /// Zero keeps the existing impressions-only behavior.
+    pub requested_active_duration: u64,
+    pub review_duration: u64,
+    pub quorum_bps: u16,
+    pub rules_version: u16,
+    pub terms_hash: [u8; 32],
+    pub bump: u8,
+}
+impl CommunityRound {
+    pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 8 + 4 + 2 + 2 + 4 + 2 + 8 + 8 + 2 + 2 + 32 + 1;
+}
+
+#[account]
+pub struct Contribution {
+    pub campaign: Pubkey,
+    pub funder: Pubkey,
+    pub gross_amount: u64,
+    pub net_amount: u64,
+    pub contribution_count: u32,
+    pub bump: u8,
+}
+impl Contribution {
+    pub const SIZE: usize = 8 + 32 + 32 + 8 + 8 + 4 + 1;
+}
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimKind {
     EmailV2,
@@ -578,6 +814,120 @@ pub struct Claim<'info> {
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, anchor_lang::system_program::System>,
 }
+
+#[derive(Accounts)]
+pub struct InitCommunityRound<'info> {
+    #[account(mut)]
+    pub advertiser: Signer<'info>,
+    #[account(
+        seeds = [b"campaign", advertiser.key().as_ref(), &campaign.id.to_le_bytes()],
+        bump = campaign.vault_bump,
+        constraint = campaign.advertiser == advertiser.key(),
+        constraint = campaign.mint == A2M_MINT,
+    )]
+    pub campaign: Account<'info, Campaign>,
+    #[account(
+        init,
+        payer = advertiser,
+        seeds = [b"community", campaign.key().as_ref()],
+        bump,
+        space = CommunityRound::SIZE,
+    )]
+    pub community: Account<'info, CommunityRound>,
+    #[account(
+        init,
+        payer = advertiser,
+        seeds = [b"contribution", campaign.key().as_ref(), advertiser.key().as_ref()],
+        bump,
+        space = Contribution::SIZE,
+    )]
+    pub starter_contribution: Account<'info, Contribution>,
+    pub system_program: Program<'info, anchor_lang::system_program::System>,
+}
+
+#[derive(Accounts)]
+pub struct Contribute<'info> {
+    #[account(mut)]
+    pub funder: Signer<'info>,
+    #[account(
+        mut,
+        constraint = funder_ata.mint == mint.key(),
+        constraint = funder_ata.owner == funder.key(),
+    )]
+    pub funder_ata: Account<'info, TokenAccount>,
+    #[account(address = A2M_MINT)]
+    pub mint: Account<'info, Mint>,
+
+    #[account(seeds = [b"platform"], bump)]
+    pub platform: Account<'info, PlatformConfig>,
+    #[account(
+        init_if_needed,
+        payer = funder,
+        associated_token::mint = mint,
+        associated_token::authority = platform,
+    )]
+    pub platform_fee_vault: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [b"campaign", campaign.advertiser.as_ref(), &campaign.id.to_le_bytes()],
+        bump = campaign.vault_bump,
+        constraint = campaign.mint == mint.key(),
+    )]
+    pub campaign: Account<'info, Campaign>,
+    #[account(
+        mut,
+        associated_token::mint = mint,
+        associated_token::authority = campaign,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+    #[account(
+        mut,
+        seeds = [b"community", campaign.key().as_ref()],
+        bump = community.bump,
+        constraint = community.campaign == campaign.key(),
+    )]
+    pub community: Account<'info, CommunityRound>,
+    #[account(
+        init_if_needed,
+        payer = funder,
+        seeds = [b"contribution", campaign.key().as_ref(), funder.key().as_ref()],
+        bump,
+        space = Contribution::SIZE,
+    )]
+    pub contribution: Account<'info, Contribution>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, anchor_lang::system_program::System>,
+}
+impl<'info> Contribute<'info> {
+    fn transfer_from_funder_to_vault(
+        &self,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer {
+                from: self.funder_ata.to_account_info(),
+                to: self.vault.to_account_info(),
+                authority: self.funder.to_account_info(),
+            },
+        )
+    }
+
+    fn transfer_from_funder_to_platform_fee_vault(
+        &self,
+    ) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer {
+                from: self.funder_ata.to_account_info(),
+                to: self.platform_fee_vault.to_account_info(),
+                authority: self.funder.to_account_info(),
+            },
+        )
+    }
+}
 impl<'info> Claim<'info> {
     fn transfer_from_vault_to_recipient(
         &self,
@@ -707,6 +1057,27 @@ pub struct CampaignInitialized {
 }
 
 #[event]
+pub struct CommunityRoundInitialized {
+    pub campaign: Pubkey,
+    pub initiator: Pubkey,
+    pub funding_deadline: i64,
+    pub initial_gross: u64,
+    pub initial_net: u64,
+    pub terms_hash: [u8; 32],
+}
+
+#[event]
+pub struct CommunityContributionAdded {
+    pub campaign: Pubkey,
+    pub funder: Pubkey,
+    pub gross_amount: u64,
+    pub fee: u64,
+    pub net_amount: u64,
+    pub funder_total_net: u64,
+    pub community_total_net: u64,
+}
+
+#[event]
 pub struct CampaignFinalized {
     pub campaign: Pubkey,
     pub claims_root: [u8; 32],
@@ -763,6 +1134,16 @@ pub enum ErrCode {
     TooManyClaims,
     #[msg("Wallet-bound claims must be claimed by the bound wallet signer")]
     WalletBoundClaimRequiresWalletSigner,
+    #[msg("Community funding is closed")]
+    FundingClosed,
+    #[msg("Invalid community funding deadline")]
+    InvalidFundingDeadline,
+    #[msg("Invalid community round terms")]
+    InvalidCommunityTerms,
+    #[msg("Invalid community round terms hash")]
+    InvalidCommunityTermsHash,
+    #[msg("Invalid community contribution account")]
+    InvalidContribution,
 }
 
 /* ------------ Helpers ------------ */
@@ -792,6 +1173,41 @@ fn hash_leaf_v2(
     let amt = amount.to_le_bytes();
     let idx = index.to_le_bytes();
     hashv(&[domain, campaign.as_ref(), user_hash, wallet.as_ref(), &amt, &idx]).to_bytes()
+}
+
+fn fee_for_amount(gross_amount: u64) -> Result<u64> {
+    Ok(((gross_amount as u128)
+        .checked_mul(PLATFORM_FEE_BPS as u128)
+        .ok_or(ErrCode::MathOverflow)?
+        / 10_000u128) as u64)
+}
+
+fn hash_community_terms(
+    campaign_id: u64,
+    funding_deadline: i64,
+    creator_reward_bps: u16,
+    voter_reward_bps: u16,
+    max_reward_voters: u32,
+    max_winners: u16,
+    requested_active_duration: u64,
+    review_duration: u64,
+    quorum_bps: u16,
+    rules_version: u16,
+) -> [u8; 32] {
+    hashv(&[
+        b"AD2_COMMUNITY_TERMS_V1",
+        &campaign_id.to_le_bytes(),
+        &funding_deadline.to_le_bytes(),
+        &creator_reward_bps.to_le_bytes(),
+        &voter_reward_bps.to_le_bytes(),
+        &max_reward_voters.to_le_bytes(),
+        &max_winners.to_le_bytes(),
+        &requested_active_duration.to_le_bytes(),
+        &review_duration.to_le_bytes(),
+        &quorum_bps.to_le_bytes(),
+        &rules_version.to_le_bytes(),
+    ])
+    .to_bytes()
 }
 
 /// Indexed Merkle verification (right = odd, left = even).
